@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Elastic Face - rabbit.png</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    body, html {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: radial-gradient(circle at 50% 40%, #ffffff 0%, #ececec 60%, #dbdbdb 100%);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    /* 포트레이트 컨테이너 */
+    #face-stage {
+      position: relative;
+      width: min(85vw, 500px);
+      height: min(85vh, 680px);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    #face-stage:active {
+      cursor: grabbing;
+    }
+
+    /* 실제 rabbit.png 이미지 태그 */
+    #face-img {
+      max-width: 100%;
+      max-height: 100%;
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      pointer-events: none;
+      display: block;
+      filter: url(#elasticFilter);
+      transform-origin: center center;
+      will-change: transform, filter;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+
+    /* SVG 필터 숨김 */
+    #svg-filters {
+      position: absolute;
+      width: 0;
+      height: 0;
+      pointer-events: none;
+      visibility: hidden;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- SVG 디스플레이스먼트 탄성 왜곡 필터 -->
+  <svg id="svg-filters" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <filter id="elasticFilter" x="-40%" y="-40%" width="180%" height="180%">
+        <!-- 동적 변위 맵 생성 -->
+        <feImage id="feMap" result="warpMap" />
+        <feDisplacementMap 
+          in="SourceGraphic" 
+          in2="warpMap" 
+          id="feDisplace" 
+          scale="0" 
+          xChannelSelector="R" 
+          yChannelSelector="G" />
+      </filter>
+    </defs>
+  </svg>
+
+  <!-- 메인 랜딩 무대 -->
+  <div id="face-stage">
+    <!-- 동일 폴더의 rabbit.png를 직접 불러오는 img 태그 -->
+    <img id="face-img" src="./rabbit.png" alt="rabbit.png" draggable="false" />
+  </div>
+
+  <script>
+    // --- 오디오 신시사이저 (고무 당김 및 탄성 튕김 사운드) ---
+    class SoundEngine {
+      constructor() {
+        this.ctx = null;
+      }
+      init() {
+        if (!this.ctx) {
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          if (AudioContext) this.ctx = new AudioContext();
+        }
+        if (this.ctx && this.ctx.state === 'suspended') {
+          this.ctx.resume();
+        }
+      }
+      playStretch(intensity) {
+        if (!this.ctx) return;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        const now = this.ctx.currentTime;
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(140 + intensity * 260, now);
+        osc.frequency.exponentialRampToValueAtTime(180 + intensity * 380, now + 0.08);
+        gain.gain.setValueAtTime(0.04, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.08);
+      }
+      playBoing(velocity) {
+        if (!this.ctx) return;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        const now = this.ctx.currentTime;
+        const baseFreq = 220 + Math.min(velocity * 0.4, 300);
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(baseFreq, now);
+        osc.frequency.exponentialRampToValueAtTime(80, now + 0.35);
+        gain.gain.setValueAtTime(0.2, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.35);
+      }
+    }
+
+    const sound = new SoundEngine();
+
+    // --- DOM 요소 및 제어 상태 ---
+    const stage = document.getElementById('face-stage');
+    const img = document.getElementById('face-img');
+    const feDisplace = document.getElementById('feDisplace');
+    const feMap = document.getElementById('feMap');
+
+    // 변위 맵 생성을 위한 오프스크린 캔버스
+    const mapSize = 256;
+    const mapCanvas = document.createElement('canvas');
+    mapCanvas.width = mapSize;
+    mapCanvas.height = mapSize;
+    const mapCtx = mapCanvas.getContext('2d');
+
+    // 물리 엔진 변수
+    let isDragging = false;
+    let startX = 0, startY = 0;
+    let pullX = 0, pullY = 0;
+    let grabNormX = 0.5, grabNormY = 0.5;
+
+    // 스프링 물리 변수 (Spring-Mass-Damper)
+    let currentX = 0, currentY = 0;
+    let velX = 0, velY = 0;
+    const stiffness = 0.18; // 탄성 계수
+    const damping = 0.76;   // 감쇄 계수
+
+    // 오프스크린 맵 갱신 함수 (SVG 변위 텍스처로 전달)
+    function updateDisplacementMap(cx, cy, radiusNorm) {
+      mapCtx.fillStyle = 'rgb(128, 128, 0)';
+      mapCtx.fillRect(0, 0, mapSize, mapSize);
+
+      const grad = mapCtx.createRadialGradient(
+        cx * mapSize, cy * mapSize, 0,
+        cx * mapSize, cy * mapSize, radiusNorm * mapSize
+      );
+
+      grad.addColorStop(0, 'rgb(255, 255, 0)');
+      grad.addColorStop(0.4, 'rgb(200, 200, 0)');
+      grad.addColorStop(1, 'rgb(128, 128, 0)');
+
+      mapCtx.fillStyle = grad;
+      mapCtx.beginPath();
+      mapCtx.arc(cx * mapSize, cy * mapSize, radiusNorm * mapSize, 0, Math.PI * 2);
+      mapCtx.fill();
+
+      // SVG feImage에 base64 URL 주입
+      feMap.setAttribute('href', mapCanvas.toDataURL('image/png'));
+    }
+
+    // 초기 중립 맵 세팅
+    updateDisplacementMap(0.5, 0.5, 0.45);
+
+    // 이벤트 핸들러
+    function onPointerDown(e) {
+      sound.init();
+      isDragging = true;
+      const rect = stage.getBoundingClientRect();
+      const clientX = e.clientX || (e.touches && e.touches[0].clientX);
+      const clientY = e.clientY || (e.touches && e.touches[0].clientY);
+
+      startX = clientX;
+      startY = clientY;
+
+      grabNormX = Math.max(0.1, Math.min(0.9, (clientX - rect.left) / rect.width));
+      grabNormY = Math.max(0.1, Math.min(0.9, (clientY - rect.top) / rect.height));
+
+      updateDisplacementMap(grabNormX, grabNormY, 0.4);
+    }
+
+    function onPointerMove(e) {
+      if (!isDragging) return;
+      const clientX = e.clientX || (e.touches && e.touches[0].clientX);
+      const clientY = e.clientY || (e.touches && e.touches[0].clientY);
+
+      pullX = clientX - startX;
+      pullY = clientY - startY;
+
+      // 거리 제한 및 저항감 적용
+      const maxDist = 240;
+      const dist = Math.hypot(pullX, pullY);
+      if (dist > maxDist) {
+        const factor = maxDist / dist;
+        pullX *= factor;
+        pullY *= factor;
+      }
+
+      sound.playStretch(Math.min(dist / maxDist, 1.0));
+    }
+
+    function onPointerUp() {
+      if (!isDragging) return;
+      isDragging = false;
+      const releaseVel = Math.hypot(pullX, pullY);
+      if (releaseVel > 20) {
+        sound.playBoing(releaseVel);
+      }
+      pullX = 0;
+      pullY = 0;
+    }
+
+    // 이벤트 리스너 등록 (마우스 & 터치 공용)
+    stage.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('mousemove', onPointerMove);
+    window.addEventListener('mouseup', onPointerUp);
+
+    stage.addEventListener('touchstart', onPointerDown, { passive: false });
+    window.addEventListener('touchmove', onPointerMove, { passive: false });
+    window.addEventListener('touchend', onPointerUp);
+    window.addEventListener('touchcancel', onPointerUp);
+
+    // --- 애니메이션 & 탄성 물리 루프 ---
+    function animate() {
+      if (isDragging) {
+        currentX += (pullX - currentX) * 0.45;
+        currentY += (pullY - currentY) * 0.45;
+        velX = 0;
+        velY = 0;
+      } else {
+        // 복원 스프링 물리 적용
+        const forceX = -stiffness * currentX;
+        const forceY = -stiffness * currentY;
+        velX = (velX + forceX) * damping;
+        velY = (velY + forceY) * damping;
+        currentX += velX;
+        currentY += velY;
+      }
+
+      // 1. 왜곡 스케일 적용 (국소 변형)
+      const displacement = Math.hypot(currentX, currentY);
+      feDisplace.setAttribute('scale', (displacement * 0.65).toFixed(2));
+
+      // 2. 전체 회전/기울임(Skew & Translate) 탄성 모션 적용
+      const rot = (currentX * 0.08).toFixed(2);
+      const skewX = (-currentX * 0.04).toFixed(2);
+      const skewY = (currentY * 0.04).toFixed(2);
+      const scaleStretch = (1 + displacement * 0.0006).toFixed(3);
+
+      img.style.transform = `
+        translate3d(${currentX * 0.28}px, ${currentY * 0.28}px, 0)
+        rotate(${rot}deg)
+        skew(${skewX}deg, ${skewY}deg)
+        scale(${scaleStretch})
+      `;
+
+      requestAnimationFrame(animate);
+    }
+
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>
